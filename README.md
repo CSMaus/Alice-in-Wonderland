@@ -16,13 +16,13 @@ First 100 dataset samples generated for testing.
 
 ## Project structure
 code/
- └── ds_prep/
-      ├── build_embeddings.py
-      └── fill_dataset_rag.py
+└── ds_prep/
+├── build_embeddings.py
+└── fill_dataset_rag.py
 data/
- ├── AliceInWonderlands.txt
- ├── alpaca_data_cleaned.json
- ├── alice_embeddings_*.npz
- └── alice_filled.json
+├── AliceInWonderlands.txt
+├── alpaca_data_cleaned.json
+├── alice_embeddings_*.npz
+└── alice_filled.json
 docs/
- └── dataset_pipeline.md
+└── dataset_pipeline.md
