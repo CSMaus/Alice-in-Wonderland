@@ -19,7 +19,7 @@ TEMP = 0.2
 DEDUP_SIM = 0.90  # cosine
 RAND_FRACTION_COMBINED = 0.10
 RAND_SEED = 42
-SAVE_EVERY = 10  # save JSON + state every N new items (and also on first write + exit/signals)
+SAVE_EVERY = 10
 
 PROMPT_A_SYS = "You know only the world of “Alice’s Adventures in Wonderland.” Use ONLY the provided CONTEXT."
 PROMPT_A_USER = (
@@ -64,7 +64,14 @@ def dedup_keep_unique(client, items, threshold=DEDUP_SIM):
         v = V[i:i+1]
         if kept is None:
             kept = v.copy(); keep.append(it); continue
-        sims = (v @ kept.T)[0]
+
+        v = np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0).astype("float32", copy=False)
+        kept = np.nan_to_num(kept, nan=0.0, posinf=0.0, neginf=0.0).astype("float32", copy=False)
+        if kept.size == 0:
+            sims = np.array([], dtype="float32")
+        else:
+            sims = (v @ kept.T).astype("float32")[0]
+
         if float(np.max(sims)) < threshold:
             keep.append(it)
             kept = np.vstack([kept, v])
@@ -185,7 +192,6 @@ def main():
             state["last_saved"] = len(out)
             return
         state["written_since_save"] += len(new_items)
-        # save when exceeded threshold since last save
         if len(out) - state.get("last_saved", 0) >= SAVE_EVERY:
             do_save()
             state["written_since_save"] = 0
