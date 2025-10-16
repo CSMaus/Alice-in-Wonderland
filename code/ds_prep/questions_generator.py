@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-import os, json, random, numpy as np
+import os, json, random, sys, atexit, signal
+import numpy as np
 from openai import OpenAI
 import faiss
 
@@ -10,6 +11,7 @@ KEY_PATH = os.path.join(DATA_DIR, "key.txt")
 NPZ_MED = os.path.join(DATA_DIR, "alice_embeddings_medium.npz")
 NPZ_COA = os.path.join(DATA_DIR, "alice_embeddings_coarse.npz")
 OUT_JSON = os.path.join(DATA_DIR, "alice_questions.json")
+STATE_PATH = os.path.join(DATA_DIR, "alice_questions.state.json")
 
 EMB_MODEL = "text-embedding-3-small"
 CHAT_MODEL = "gpt-4o"
@@ -17,7 +19,7 @@ TEMP = 0.2
 DEDUP_SIM = 0.90  # cosine
 RAND_FRACTION_COMBINED = 0.10
 RAND_SEED = 42
-SAVE_EVERY = 10
+SAVE_EVERY = 10  # save JSON + state every N new items (and also on first write + exit/signals)
 
 PROMPT_A_SYS = "You know only the world of “Alice’s Adventures in Wonderland.” Use ONLY the provided CONTEXT."
 PROMPT_A_USER = (
@@ -46,63 +48,66 @@ def load_npz(path):
 def embed_texts(client, texts):
     resp = client.embeddings.create(model=EMB_MODEL, input=texts)
     V = np.array([d.embedding for d in resp.data], dtype="float32")
-    faiss.normalize_L2(V)
+    # no NaN/Inf, no divide-by-zero
+    V = np.nan_to_num(V, nan=0.0, posinf=0.0, neginf=0.0)
+    norms = np.linalg.norm(V, axis=1, keepdims=True)
+    norms = np.where(norms == 0.0, 1.0, norms)
+    V = V / norms
     return V
 
-def dedup_keep_unique(client, items):
+def dedup_keep_unique(client, items, threshold=DEDUP_SIM):
     if not items: return items
     qs = [i["instruction"] + " ||| " + (i["input"] or "") for i in items]
     V = embed_texts(client, qs)
-    keep = []
-    kept = None
+    keep, kept = [], None
     for i, it in enumerate(items):
         v = V[i:i+1]
         if kept is None:
             kept = v.copy(); keep.append(it); continue
         sims = (v @ kept.T)[0]
-        if np.max(sims) < DEDUP_SIM:
+        if float(np.max(sims)) < threshold:
             keep.append(it)
             kept = np.vstack([kept, v])
     return keep
-
-def combined_contexts(chunks_med, chunks_coa):
-    # old, without limits
-    Lm, Lc = len(chunks_med), len(chunks_coa)
-    step_m, step_c = 3, 2
-    for i in range(0, max(0, Lm - 2), step_m):
-        med_span = [str(chunks_med[i]), str(chunks_med[i+1]), str(chunks_med[i+2])]
-        j = (i // step_m * step_c + Lc // 2) % max(1, Lc - 1)
-        coa_span = [str(chunks_coa[j]), str(chunks_coa[j+1])]
-        yield "\n\n".join(med_span + coa_span)
 
 def medium_only_contexts(chunks_med, span=4, step=1):
     L = len(chunks_med)
     for i in range(0, max(0, L - span + 1), step):
         yield "\n\n".join(str(ch) for ch in chunks_med[i:i+span])
 
-def combined_contexts_random(chunks_med, chunks_coa, fraction=0.10, seed=None):
+def plan_random_pairs(Lm, Lc, fraction, seed):
     rng = random.Random(seed)
-    Lm, Lc = len(chunks_med), len(chunks_coa)
-
-    # candidate starts for triples (medium) and pairs (coarse)
-    med_starts = list(range(0, max(0, Lm - 2)))   # i, i+1, i+2
-    coa_starts = list(range(0, max(0, Lc - 1)))   # j, j+1
-
-    # sample size = 10% of all coarse pairs (at least 1)
+    med_starts = list(range(0, max(0, Lm - 2)))
+    coa_starts = list(range(0, max(0, Lc - 1)))
     n = max(1, int(round(fraction * len(coa_starts))))
-    # cannot sample more than available starts
     n = min(n, len(med_starts), len(coa_starts))
-
-    # sample without replacement
     sel_med = rng.sample(med_starts, n)
     sel_coa = rng.sample(coa_starts, n)
+    return sel_med, sel_coa
 
-    for i, j in zip(sel_med, sel_coa):
-        if i + 2 >= Lm or j + 1 >= Lc:
-            continue
-        med_span = [str(chunks_med[i]), str(chunks_med[i+1]), str(chunks_med[i+2])]
-        coa_span = [str(chunks_coa[j]), str(chunks_coa[j+1])]
-        yield "\n\n".join(med_span + coa_span)
+def load_state(path):
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            s = json.load(f)
+            s.setdefault("written_since_save", 0)
+            s.setdefault("last_saved", 0)
+            return s
+    return {
+        "rand_fraction": RAND_FRACTION_COMBINED,
+        "rand_seed": RAND_SEED,
+        "medium_pos": 0,
+        "mixed_med_idx": [],
+        "mixed_coa_idx": [],
+        "mixed_pos": 0,
+        "written_since_save": 0,
+        "last_saved": 0
+    }
+
+def save_state(path, state):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
 
 def save_json_atomic(path, data):
     tmp = path + ".tmp"
@@ -110,31 +115,96 @@ def save_json_atomic(path, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
 
+def load_existing_list(path):
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list): return data
+        except Exception:
+            pass
+    return []
+
+def strip_code_fences(s: str) -> str:
+    t = s.strip()
+    if t.startswith("```"):
+        t = t.strip("`")
+        if t.lower().startswith("json"):
+            t = t[4:].lstrip()
+    return t
+
+def parse_json_array(text):
+    try:
+        return json.loads(text)
+    except Exception:
+        return json.loads(strip_code_fences(text))
+
 def main():
     client = OpenAI(api_key=load_key(KEY_PATH))
     C_med = load_npz(NPZ_MED)
     C_coa = load_npz(NPZ_COA)
 
     med_ctxs = list(medium_only_contexts(C_med, span=4, step=1))
-    comb_ctxs = list(combined_contexts_random(C_med, C_coa, fraction=RAND_FRACTION_COMBINED, seed=RAND_SEED))
     print(f"[info] medium-only contexts: {len(med_ctxs)}", flush=True)
-    print(f"[info] mixed contexts (random 10%): {len(comb_ctxs)}", flush=True)
 
-    out = []
+    state = load_state(STATE_PATH)
+    Lm, Lc = len(C_med), len(C_coa)
+    if not state["mixed_med_idx"] or not state["mixed_coa_idx"]:
+        sel_med, sel_coa = plan_random_pairs(Lm, Lc, state["rand_fraction"], state["rand_seed"])
+        state["mixed_med_idx"] = sel_med
+        state["mixed_coa_idx"] = sel_coa
+        state["mixed_pos"] = 0
+        save_state(STATE_PATH, state)
+    print(f"[info] mixed pairs planned: {len(state['mixed_med_idx'])}", flush=True)
 
-    for i, ctx in enumerate(med_ctxs, 1):
+    out = load_existing_list(OUT_JSON)
+    print(f"[info] existing items in {os.path.basename(OUT_JSON)}: {len(out)}", flush=True)
+
+    def do_save():
+        save_json_atomic(OUT_JSON, out)
+        save_state(STATE_PATH, state)
+        print(f"[save] {OUT_JSON} | items={len(out)} | medium_pos={state['medium_pos']} | mixed_pos={state['mixed_pos']}", flush=True)
+
+    atexit.register(do_save)
+    def _sig_handler(signum, frame):
+        print(f"[signal] caught {signum}, saving...", flush=True)
+        do_save()
+        sys.exit(1)
+    signal.signal(signal.SIGINT, _sig_handler)
+    signal.signal(signal.SIGTERM, _sig_handler)
+
+    def add_items(new_items):
+        nonlocal out, state
+        if not new_items:
+            return
+        prev_len = len(out)
+        out.extend(new_items)
+        if prev_len == 0:
+            do_save()
+            state["written_since_save"] = 0
+            state["last_saved"] = len(out)
+            return
+        state["written_since_save"] += len(new_items)
+        # save when exceeded threshold since last save
+        if len(out) - state.get("last_saved", 0) >= SAVE_EVERY:
+            do_save()
+            state["written_since_save"] = 0
+            state["last_saved"] = len(out)
+
+    for i in range(state["medium_pos"], len(med_ctxs)):
+        ctx = med_ctxs[i]
+
         respA = client.chat.completions.create(
             model=CHAT_MODEL, temperature=TEMP,
             messages=[{"role":"system","content":PROMPT_A_SYS},
                       {"role":"user","content":PROMPT_A_USER.format(ctx=ctx)}]
         )
         try:
-            qlist = json.loads(respA.choices[0].message.content)
+            qlist = parse_json_array(respA.choices[0].message.content)
             qlist = [q.strip() for q in qlist if isinstance(q, str) and q.strip()]
         except Exception:
             qlist = []
-        for q in qlist:
-            out.append({"instruction": q, "input": "", "output": ""})
+        add_items([{"instruction": q, "input": "", "output": ""} for q in qlist])
 
         respB = client.chat.completions.create(
             model=CHAT_MODEL, temperature=TEMP,
@@ -142,34 +212,41 @@ def main():
                       {"role":"user","content":PROMPT_B_USER.format(ctx=ctx)}]
         )
         try:
-            pairs = json.loads(respB.choices[0].message.content)
+            pairs = parse_json_array(respB.choices[0].message.content)
             pairs = [p for p in pairs if isinstance(p, dict)
                      and isinstance(p.get("instruction",""), str)
                      and isinstance(p.get("input",""), str)
                      and p["instruction"].strip() and p["input"].strip()]
         except Exception:
             pairs = []
-        for p in pairs:
-            out.append({"instruction": p["instruction"].strip(),
-                        "input": p["input"].strip(),
-                        "output": ""})
-        if len(out) % SAVE_EVERY == 0:
-            save_json_atomic(OUT_JSON, out)
-        print(f"[progress][medium] {i}/{len(med_ctxs)} | items={len(out)}", flush=True)
+        add_items([{"instruction": p["instruction"].strip(),
+                    "input": p["input"].strip(),
+                    "output": ""} for p in pairs])
 
-    for j, ctx in enumerate(comb_ctxs, 1):
+        state["medium_pos"] = i + 1
+        print(f"[progress][medium] {state['medium_pos']}/{len(med_ctxs)} | items={len(out)}", flush=True)
+
+    for k in range(state["mixed_pos"], len(state["mixed_med_idx"])):
+        i = state["mixed_med_idx"][k]
+        j = state["mixed_coa_idx"][k]
+        if i + 2 >= len(C_med) or j + 1 >= len(C_coa):
+            state["mixed_pos"] = k + 1
+            continue
+
+        ctx = "\n\n".join([str(C_med[i]), str(C_med[i+1]), str(C_med[i+2]),
+                           str(C_coa[j]), str(C_coa[j+1])])
+
         respA = client.chat.completions.create(
             model=CHAT_MODEL, temperature=TEMP,
             messages=[{"role":"system","content":PROMPT_A_SYS},
                       {"role":"user","content":PROMPT_A_USER.format(ctx=ctx)}]
         )
         try:
-            qlist = json.loads(respA.choices[0].message.content)
+            qlist = parse_json_array(respA.choices[0].message.content)
             qlist = [q.strip() for q in qlist if isinstance(q, str) and q.strip()]
         except Exception:
             qlist = []
-        for q in qlist:
-            out.append({"instruction": q, "input": "", "output": ""})
+        add_items([{"instruction": q, "input": "", "output": ""} for q in qlist])
 
         respB = client.chat.completions.create(
             model=CHAT_MODEL, temperature=TEMP,
@@ -177,28 +254,25 @@ def main():
                       {"role":"user","content":PROMPT_B_USER.format(ctx=ctx)}]
         )
         try:
-            pairs = json.loads(respB.choices[0].message.content)
+            pairs = parse_json_array(respB.choices[0].message.content)
             pairs = [p for p in pairs if isinstance(p, dict)
                      and isinstance(p.get("instruction",""), str)
                      and isinstance(p.get("input",""), str)
                      and p["instruction"].strip() and p["input"].strip()]
         except Exception:
             pairs = []
-        for p in pairs:
-            out.append({"instruction": p["instruction"].strip(),
-                        "input": p["input"].strip(),
-                        "output": ""})
-        if len(out) % SAVE_EVERY == 0:
-            save_json_atomic(OUT_JSON, out)
-        print(f"[progress][mixed] {j}/{len(comb_ctxs)} | items={len(out)}", flush=True)
+        add_items([{"instruction": p["instruction"].strip(),
+                    "input": p["input"].strip(),
+                    "output": ""} for p in pairs])
 
-    out = dedup_keep_unique(client, out)
+        state["mixed_pos"] = k + 1
+        print(f"[progress][mixed] {state['mixed_pos']}/{len(state['mixed_med_idx'])} | items={len(out)}", flush=True)
 
-    with open(OUT_JSON, "w", encoding="utf-8") as f:
-        json.dump(out, f, ensure_ascii=False, indent=2)
-    print(f"[saved] {OUT_JSON} | {len(out)} items")
+    out[:] = dedup_keep_unique(client, out, threshold=DEDUP_SIM)
+    save_json_atomic(OUT_JSON, out)
+    state["last_saved"] = len(out)
+    save_state(STATE_PATH, state)
+    print(f"[saved] {OUT_JSON} | total items={len(out)}", flush=True)
 
 if __name__ == "__main__":
     main()
-
-
