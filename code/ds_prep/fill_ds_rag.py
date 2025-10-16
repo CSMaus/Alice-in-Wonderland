@@ -26,7 +26,7 @@ CONFIGS = {"short", "fine", "medium", "coarse"}
 EMB_NPZ_BASENAME = os.path.join(DATA_DIR, "alice_embeddings")
 NPZ_PATHS = {name: f"{EMB_NPZ_BASENAME}_{name}.npz" for name in CONFIGS}
 ALPACA_JSON = os.path.join(DATA_DIR, "alpaca_data_cleaned.json")
-OUT_JSONL = os.path.join(DATA_DIR, "alice_common_dataset.json")
+OUT_JSONL = os.path.join(DATA_DIR, "alice_world_dataset.json")
 
 EMB_MODEL = "text-embedding-3-small"
 CHAT_MODEL = "gpt-4o"  # -mini
@@ -139,7 +139,7 @@ def make_user_prompt(ctx_chunks, instr, inp):
     return f"{ctx_block}Instruction: {instr}\nInput: {inp}\nAnswer:"
 
 def make_user_prompt_improved(ctx_chunks, instr, inp):
-    # improved
+    # improved - limin tokens
     ctx_block = ""
     if ctx_chunks:
         joined = "\n\n".join(ctx_chunks)
@@ -161,15 +161,26 @@ def main():
         chunks_map[name] = chunks
 
     items = load_alpaca(ALPACA_JSON)
-    items = items[:100]  # for test first
+    # items = items[:100]  # for test first
+    existing_pairs = set()
+    if os.path.exists(OUT_JSONL):
+        with jsonlines.open(OUT_JSONL, "r") as r:
+            for o in r:
+                existing_pairs.add((o.get("instruction", ""), o.get("input", "")))
+    print(f"[resume] existing items: {len(existing_pairs)}")
 
     out_path = OUT_JSONL
     n = len(items)
     done = 0
-    with jsonlines.open(out_path, "w") as w:
+    with jsonlines.open(out_path, "a") as w:
         for it in items:
+
             instr = (it.get("instruction") or "").strip()
             inp = (it.get("input") or it.get("context") or "").strip()  # Dolly uses "context"
+
+            key = (instr, inp)
+            if key in existing_pairs:
+                continue
 
             query = (instr + "\n" + inp).strip() if inp else instr
             if not query:
