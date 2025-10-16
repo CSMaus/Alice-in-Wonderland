@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+'''
+Now I use only medium for full book. And combination of medium and coarse.
+I think I have to add smaller ones too, and change instuction to generate some precise questions
+and some very common questions, and use maybe 20% instead of 10.
+'''
 import os, json, random, sys, atexit, signal
 import numpy as np
 from openai import OpenAI

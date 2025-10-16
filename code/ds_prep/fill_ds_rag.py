@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 """
+I'll remake it, so when the limit of idk type of questions will be filled, rest of questions would be ONLY
+remade to be questions regarding the alice in wonderland only.
+In the beginning for each question with answers of type "idk" also should be converted to the question/instruction
+related the Alice tale.
+
 Fill instruction dataset using RAG over Alice embeddings.
 
 - Reads API key from ../data/key.txt
