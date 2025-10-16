@@ -46,6 +46,7 @@ Each context produces two types:
 - Instruction + Input pairs (situation + question).<br>
 
 Outputs are empty — they’re filled later by `fill_ds_rag.py`.
+(currently total 378)
 
 ## System Prompt
 *under edit rn
